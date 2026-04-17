@@ -328,6 +328,19 @@ def delete_session(session_id: str, _user: dict = Depends(verify_token)):
 # Operations Endpoints
 # ─────────────────────────────────────────────────────────
 
+@app.get("/", tags=["Info"])
+def root():
+    return {
+        "app": settings.app_name,
+        "version": settings.app_version,
+        "environment": settings.environment,
+        "endpoints": {
+            "ask": "POST /ask (requires X-API-Key)",
+            "health": "GET /health",
+            "ready": "GET /ready",
+        },
+    }
+
 @app.get("/health", tags=["Operations"])
 def health():
     """Liveness probe. Platform restarts container if this fails."""
