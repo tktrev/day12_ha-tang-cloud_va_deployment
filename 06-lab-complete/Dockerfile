@@ -39,6 +39,9 @@ RUN chown -R agent:agent /app
 
 USER agent
 
+# Re-install uvicorn in runtime stage to guarantee availability
+RUN pip install --no-cache-dir uvicorn[standard]==0.30.0
+
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
