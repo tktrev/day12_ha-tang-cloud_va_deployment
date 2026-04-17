@@ -1,47 +1,41 @@
 # ============================================================
-# Production Dockerfile — Multi-stage build
-# Stage 1 (builder): installs all dependencies
-# Stage 2 (runtime): copies only what it needed to run
+# Production Dockerfile — Multi-stage, < 500 MB, non-root
 # ============================================================
 
-# ── Stage 1: Builder ──────────────────────────────────
+# Stage 1: Builder
 FROM python:3.11-slim AS builder
 
-WORKDIR /app
+WORKDIR /build
 
-# Build dependencies (needed to compile some Python packages like numpy, psycopg2)
-RUN apt-get update && apt-get install -y \
-    gcc \
-    libpq-dev \
+RUN apt-get update && apt-get install -y gcc libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages to /app (standard site-packages, not --user)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --user -r requirements.txt
 
-# Copy the whole app (builder stage is throwaway)
-COPY app/ ./app/
-COPY utils/ ./utils/
 
-# ── Stage 2: Runtime ─────────────────────────────────
+# Stage 2: Runtime
 FROM python:3.11-slim AS runtime
 
-# Create non-root user (security best practice)
+# Non-root user
 RUN groupadd -r agent && useradd -r -g agent -d /app agent
 
 WORKDIR /app
 
-# Copy everything from builder — packages + app code
-COPY --from=builder /app /app
+# Copy packages từ builder
+COPY --from=builder /root/.local /home/agent/.local
 
-# Set ownership
+# Copy application
+COPY app/ ./app/
+COPY utils/ ./utils/
+
 RUN chown -R agent:agent /app
 
 USER agent
 
-# Re-install uvicorn in runtime stage to guarantee availability
-RUN pip install --no-cache-dir uvicorn[standard]==0.30.0
-
+ENV PATH=/home/agent/.local/bin:$PATH
+# ENV PYTHONPATH=/app
+ENV PYTHONPATH=/home/agent/.local/lib/python3.11/site-packages:/app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
@@ -53,5 +47,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" \
     || exit 1
 
-# Use python -m uvicorn so Python finds uvicorn in /app/site-packages
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2"]
