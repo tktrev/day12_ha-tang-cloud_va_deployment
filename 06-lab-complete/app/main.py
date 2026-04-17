@@ -9,9 +9,9 @@ Functional:
 Non-functional:
   ✅ Dockerized with multi-stage build
   ✅ Config from environment variables (12-factor)
-  ✅ JWT authentication
-  ✅ Rate limiting (Redis sliding window, 10 req/min per user)
-  ✅ Cost guard (Redis daily budget $10/month per user, $50 global)
+  ✅ JWT authentication (app/auth.py)
+  ✅ Rate limiting (Redis sliding window, 10 req/min per user) (app/rate_limiter.py)
+  ✅ Cost guard (Redis daily budget $10/month per user, $50 global) (app/cost_guard.py)
   ✅ Health check endpoint (/health)
   ✅ Readiness check endpoint (/ready)
   ✅ Graceful shutdown
@@ -33,17 +33,17 @@ import logging
 import json
 import uuid
 from datetime import datetime, timezone
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
-import jwt
-from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
 from app.config import settings
+from app.auth import verify_token, authenticate_user, create_token
+import app.rate_limiter as rate_limiter
+import app.cost_guard as cost_guard
 
 # ─────────────────────────────────────────────────────────
 # Logging — JSON structured
@@ -59,12 +59,6 @@ _is_ready = False
 _request_count = 0
 _error_count = 0
 
-# Demo users for JWT auth
-DEMO_USERS = {
-    "student": {"password": "demo123", "role": "user"},
-    "teacher": {"password": "teach456", "role": "admin"},
-}
-
 # ─────────────────────────────────────────────────────────
 # Redis (optional fallback to in-memory)
 # ─────────────────────────────────────────────────────────
@@ -78,6 +72,8 @@ try:
     _redis_client.ping()
     _use_redis = True
     logger.info("Connected to Redis")
+    rate_limiter.init_redis(_redis_client)
+    cost_guard.init_redis(_redis_client)
 except Exception:
     logger.warning("Redis not available — using in-memory store (not stateless!)")
 
@@ -128,194 +124,11 @@ def append_to_history(session_id: str, role: str, content: str):
         "content": content,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
-    # Keep only last N messages
     if len(history) > settings.max_history_messages:
         history = history[-settings.max_history_messages:]
     session["history"] = history
     save_session(session_id, session)
     return history
-
-
-# ─────────────────────────────────────────────────────────
-# Redis-backed rate limiter (sliding window)
-# ─────────────────────────────────────────────────────────
-
-def check_rate_limit(user_id: str) -> dict:
-    """
-    Sliding window rate limiting per user.
-    Uses Redis sorted set for accurate window tracking.
-    Returns dict with limit/remaining info.
-    """
-    now = time.time()
-    window_seconds = 60
-    key = f"ratelimit:{user_id}"
-
-    if _use_redis:
-        pipe = _redis_client.pipeline()
-        # Remove old entries outside the window
-        pipe.zremrangebyscore(key, 0, now - window_seconds)
-        # Count current requests in window
-        pipe.zcard(key)
-        # Add current request
-        pipe.zadd(key, {str(now): now})
-        # Set expiry
-        pipe.expire(key, window_seconds + 1)
-        results = pipe.execute()
-        current_count = results[1]  # zcard result before adding current
-
-        limit = settings.rate_limit_per_minute
-        remaining = max(0, limit - current_count - 1)
-
-        if current_count >= limit:
-            oldest = _redis_client.zrange(key, 0, 0, withscores=True)
-            retry_after = int(oldest[0][1] + window_seconds - now) + 1 if oldest else 60
-            raise HTTPException(
-                status_code=429,
-                detail=f"Rate limit exceeded: {limit} req/min",
-                headers={
-                    "Retry-After": str(retry_after),
-                    "X-RateLimit-Limit": str(limit),
-                    "X-RateLimit-Remaining": "0",
-                    "X-RateLimit-Reset": str(int(now) + window_seconds),
-                },
-            )
-        return {"limit": limit, "remaining": remaining, "reset_at": int(now) + window_seconds}
-
-    # Fallback in-memory rate limiter
-    if not hasattr(check_rate_limit, "_windows"):
-        check_rate_limit._windows = defaultdict(deque)
-    window = check_rate_limit._windows[user_id]
-    while window and window[0] < now - window_seconds:
-        window.popleft()
-    limit = settings.rate_limit_per_minute
-    if len(window) >= limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {limit} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
-    return {"limit": limit, "remaining": limit - len(window) - 1, "reset_at": int(now) + window_seconds}
-
-
-# ─────────────────────────────────────────────────────────
-# Redis-backed cost guard (daily budget per user)
-# ─────────────────────────────────────────────────────────
-
-def check_budget(user_id: str) -> None:
-    """Check if user has budget remaining. Raises 402 if exceeded."""
-    if _use_redis:
-        month_key = datetime.now().strftime("%Y-%m")
-        key = f"budget:{user_id}:{month_key}"
-        current = float(_redis_client.get(key) or 0)
-
-        if current >= settings.daily_budget_usd:
-            raise HTTPException(
-                status_code=402,
-                detail={
-                    "error": "Daily budget exceeded",
-                    "used_usd": round(current, 4),
-                    "budget_usd": settings.daily_budget_usd,
-                    "resets_at": "midnight UTC",
-                },
-            )
-    else:
-        # In-memory fallback
-        if not hasattr(check_budget, "_records"):
-            check_budget._records = {}
-        today = time.strftime("%Y-%m-%d")
-        record = check_budget._records.get(user_id, {"day": today, "cost": 0.0})
-        if record["day"] != today:
-            record = {"day": today, "cost": 0.0}
-        if record["cost"] >= settings.daily_budget_usd:
-            raise HTTPException(
-                status_code=402,
-                detail={
-                    "error": "Daily budget exceeded",
-                    "used_usd": round(record["cost"], 4),
-                    "budget_usd": settings.daily_budget_usd,
-                },
-            )
-        check_budget._records[user_id] = record
-
-
-def record_usage(user_id: str, input_tokens: int, output_tokens: int) -> dict:
-    """Record usage and return usage record."""
-    input_cost = (input_tokens / 1000) * (settings.price_per_1k_input_tokens / 1000)
-    output_cost = (output_tokens / 1000) * (settings.price_per_1k_output_tokens / 1000)
-    total_cost = input_cost + output_cost
-
-    if _use_redis:
-        month_key = datetime.now().strftime("%Y-%m")
-        key = f"budget:{user_id}:{month_key}"
-        _redis_client.incrbyfloat(key, total_cost)
-        _redis_client.expire(key, 32 * 24 * 3600)  # 32 days TTL
-        current = float(_redis_client.get(key) or 0)
-        return {
-            "user_id": user_id,
-            "date": month_key,
-            "cost_usd": round(current, 6),
-            "budget_usd": settings.daily_budget_usd,
-            "remaining_usd": round(settings.daily_budget_usd - current, 6),
-        }
-    else:
-        if not hasattr(record_usage, "_records"):
-            record_usage._records = {}
-        today = time.strftime("%Y-%m-%d")
-        record = record_usage._records.get(user_id, {"day": today, "cost": 0.0})
-        if record["day"] != today:
-            record = {"day": today, "cost": 0.0}
-        record["cost"] += total_cost
-        record_usage._records[user_id] = record
-        return {
-            "user_id": user_id,
-            "date": record["day"],
-            "cost_usd": round(record["cost"], 6),
-            "budget_usd": settings.daily_budget_usd,
-            "remaining_usd": round(settings.daily_budget_usd - record["cost"], 6),
-        }
-
-
-# ─────────────────────────────────────────────────────────
-# JWT Authentication
-# ─────────────────────────────────────────────────────────
-security = HTTPBearer(auto_error=False)
-
-
-def create_token(username: str, role: str) -> str:
-    """Create JWT token with expiry."""
-    payload = {
-        "sub": username,
-        "role": role,
-        "iat": datetime.now(timezone.utc),
-        "exp": datetime.now(timezone.utc).timestamp() + settings.jwt_expire_minutes * 60,
-    }
-    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
-
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)) -> dict:
-    """Dependency: verify JWT token from Authorization header."""
-    if not credentials:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required. Include: Authorization: Bearer <token>",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    try:
-        payload = jwt.decode(credentials.credentials, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
-        return {"username": payload["sub"], "role": payload["role"]}
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired. Please login again.")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=403, detail="Invalid token.")
-
-
-def authenticate_user(username: str, password: str) -> dict:
-    """Authenticate user against demo users."""
-    user = DEMO_USERS.get(username)
-    if not user or user["password"] != password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    return {"username": username, "role": user["role"]}
 
 
 # ─────────────────────────────────────────────────────────
@@ -331,7 +144,7 @@ async def lifespan(app: FastAPI):
         "environment": settings.environment,
         "redis": _use_redis,
     }))
-    time.sleep(0.1)  # simulate initialization
+    time.sleep(0.1)
     _is_ready = True
     logger.info("Agent is ready to serve requests")
 
@@ -446,10 +259,10 @@ async def ask_agent(
     username = user["username"]
 
     # Rate limiting
-    check_rate_limit(username)
+    rate_limiter.check_rate_limit(username)
 
     # Budget check
-    check_budget(username)
+    cost_guard.check_budget(username)
 
     # Session management (stateless)
     session_id = body.session_id or str(uuid.uuid4())
@@ -471,7 +284,7 @@ async def ask_agent(
     # Record usage
     input_tokens = len(body.question.split()) * 2
     output_tokens = len(answer.split()) * 2
-    usage = record_usage(username, input_tokens, output_tokens)
+    usage = cost_guard.record_usage(username, input_tokens, output_tokens)
 
     logger.info(json.dumps({
         "event": "agent_response",
@@ -547,7 +360,7 @@ def metrics(user: dict = Depends(verify_token)):
         key = f"budget:{username}:{month_key}"
         cost = float(_redis_client.get(key) or 0)
     else:
-        cost = getattr(check_budget, "_records", {}).get(username, {}).get("cost", 0.0)
+        cost = getattr(cost_guard.check_budget, "_records", {}).get(username, {}).get("cost", 0.0)
     return {
         "user": username,
         "uptime_seconds": round(time.time() - START_TIME, 1),
@@ -574,7 +387,6 @@ signal.signal(signal.SIGINT, _handle_signal)
 # ─────────────────────────────────────────────────────────
 def _mock_llm_ask(question: str, history: list[dict]) -> str:
     """Mock LLM that considers conversation history."""
-    # Simple mock — in production, replace with OpenAI/Anthropic API
     responses = [
         f"Here's my response to '{question}' based on our conversation.",
         f"Regarding '{question}': as we discussed, the key point is...",
