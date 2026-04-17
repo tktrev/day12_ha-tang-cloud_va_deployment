@@ -277,7 +277,7 @@ async def ask_agent(
     turn = len([m for m in history if m["role"] == "user"])
 
     # Call LLM
-    answer = _mock_llm_ask(body.question, history)
+    answer = _llm_ask(body.question, history)
 
     # Append assistant response to history
     append_to_history(session_id, "assistant", answer)
@@ -397,19 +397,39 @@ signal.signal(signal.SIGINT, _handle_signal)
 
 
 # ─────────────────────────────────────────────────────────
-# Mock LLM with conversation context
+# OpenAI LLM
 # ─────────────────────────────────────────────────────────
-def _mock_llm_ask(question: str, history: list[dict]) -> str:
-    """Mock LLM that considers conversation history."""
-    responses = [
-        f"Here's my response to '{question}' based on our conversation.",
-        f"Regarding '{question}': as we discussed, the key point is...",
-        f"Following up on your question about '{question}': the answer is...",
-        f"Great question '{question}'! In context of our conversation:",
-    ]
-    import hashlib
-    idx = int(hashlib.md5(question.encode()).hexdigest()[0], 16) % len(responses)
-    return responses[idx] + f" (turn {len([m for m in history if m['role']=='user'])})"
+from openai import OpenAI
+
+_openai_client: OpenAI | None = None
+
+
+def _get_openai_client() -> OpenAI:
+    """Get or create the OpenAI client (lazy initialization)."""
+    global _openai_client
+    if _openai_client is None:
+        if not settings.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set — cannot use OpenAI LLM")
+        _openai_client = OpenAI(api_key=settings.openai_api_key)
+    return _openai_client
+
+
+def _llm_ask(question: str, history: list[dict]) -> str:
+    """Call OpenAI LLM with conversation history."""
+    client = _get_openai_client()
+
+    # Build messages from history + current question
+    messages = []
+    for msg in history:
+        role = "assistant" if msg.get("role") == "assistant" else "user"
+        messages.append({"role": role, "content": msg.get("content", "")})
+    messages.append({"role": "user", "content": question})
+
+    response = client.chat.completions.create(
+        model=settings.llm_model,
+        messages=messages,
+    )
+    return response.choices[0].message.content or ""
 
 
 if __name__ == "__main__":
