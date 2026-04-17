@@ -125,7 +125,7 @@ Client (curl/Postman)
 
 ### Exercise 3.1: Railway deployment
 
-- **URL:** https://day12ha-tang-cloudvadeployment-production-761e.up.railway.app
+- **URL:** https://day12ha-tang-cloudvadeployment-production-8a77.up.railway.app
 - **Screenshot:** `03-cloud-deployment/railway/app_screenshot.png`
 
 **Steps taken:**
